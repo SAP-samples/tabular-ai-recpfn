@@ -1,0 +1,18 @@
+logs/*
+output/*
+datasets/*
+datasets_small/*
+datasets_old/*
+embedding_store/*
+*.log
+*.pt
+*.pyc
+*sequences.json
+config.json
+__pycache__/
+.DS_Store
+
+# Claude
+CLAUDE.md
+.claude/
+memory/
