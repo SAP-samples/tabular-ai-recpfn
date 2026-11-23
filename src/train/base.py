@@ -1,5 +1,6 @@
 import torch
 from copy import deepcopy
+from itertools import chain
 import json
 import logging
 import os
@@ -18,27 +19,30 @@ from train.util import combined_dataloader, check_nan
 from util.metrics import MetricCollection
 from util.log_time import LogTime
 
-
+ 
+# Initialize logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# Remove all existing handlers
 for handler in logger.handlers:
     logger.removeHandler(handler)
 
+# Add a new StreamHandler with a formatter
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(handler)
 
+# Disable propagation to parent loggers
 logger.propagate = False
 
 from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR, CosineAnnealingLR
-
 
 class BaseTrain:
     """
     Base class for training workflows, handling dataset preparation, model loading/saving,
     and iteration logic for training/validation epochs.
-
+    
     :param output_dir: Directory to store checkpoints and logs.
     :param config: Configuration object for training and model hyperparameters.
     """
@@ -69,7 +73,7 @@ class BaseTrain:
             val_datasets = [DefaultTrainDataset(input_dir=ds, config=self.config, mode='validate')
                             for ds in self.config.train_datasets]
         return train_datasets, val_datasets
-
+    
     def get_train_dataloaders(self,
                         train_datasets:list[TrainDataset],
                         val_datasets:list[TrainDataset]):
@@ -95,7 +99,7 @@ class BaseTrain:
             train_loader = train_loaders[0]
         else:
             train_loader = combined_dataloader(train_loaders)
-
+        
         if len(val_loaders) == 0:
             raise ValueError("No validation datasets found.")
         elif len(val_loaders) == 1:
@@ -103,7 +107,7 @@ class BaseTrain:
         else:
             val_loader = combined_dataloader(val_loaders, restart_on_exhausted=False)
         return train_loader, val_loader
-
+    
     def process_train_datasets(self):
         """
         Prepare cached datasets and dataloaders for training/validation.
@@ -113,7 +117,7 @@ class BaseTrain:
         self.train_datasets, self.val_datasets = self.get_train_datasets()
         self.train_loader, self.val_loader = self.get_train_dataloaders(
             self.train_datasets, self.val_datasets)
-
+    
     def load_model(self, model_path:str=None, embedding_dim:int=None):
         """
         Initialize model (and optional baseline) and load weights from a path if provided.
@@ -145,7 +149,7 @@ class BaseTrain:
         """
         torch.save(self.model.state_dict(), model_path)
         logger.info(f"Model saved to {model_path}")
-
+    
     def iterate_one_epoch(self,
                           model: RecPFN,
                           baseline_model: EmbKNN,
@@ -181,19 +185,22 @@ class BaseTrain:
                 baseline_metrics = MetricCollection(self.config)
         accumulation_steps = self.config.num_gradient_accumulation_steps if train else 1
 
-        timers = LogTime()
+        # Time profiling variables
+        timers = LogTime()                  
 
         if train:
             model.train()
         else:
             model.eval()
         valid_mask = None
-
+        skip_accumulation_window = False
+        
         timers.start_stage('dataloader')
         for batch_count, batch in enumerate(dataloader):
             timers.end_stage('dataloader')
             step = current_step + batch_count
-
+            
+            # Time: Data transfer - Use non_blocking=True for async transfer
             timers.start_stage('data_transfer')
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True) if batch_count % accumulation_steps == 0 else None
@@ -215,43 +222,60 @@ class BaseTrain:
             loss_mask = mask
             tmp_loss, _ = \
                 model.get_loss(outputs, mapped_labels, sample_embeddings,
-                               mask=loss_mask, evaluate_last_only=evaluate_last_only,
+                               mask=loss_mask, evaluate_last_only=evaluate_last_only, 
                                valid_mask=valid_mask, metrics=metrics)
             timers.end_stage('loss_computation')
-
+            
+            # check if any model params or loss or inputs are nan or inf
             if check_nan([tmp_loss, input_embs, outputs]) is not None:
                 raise ValueError("NaN or Inf values detected in inputs, outputs, or loss.")
-
+            
             if train:
                 timers.start_stage('backward_pass')
-                (tmp_loss / accumulation_steps).backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
+                (tmp_loss / accumulation_steps).backward()  # Scale loss for accumulation
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
+                if not torch.isfinite(grad_norm):
+                    # Non-finite grads would poison the weights (and AdamW moments); drop this accumulation window
+                    logger.info("Non-finite gradient norm detected; skipping optimizer step.")
+                    optimizer.zero_grad(set_to_none=True)
+                    skip_accumulation_window = True
                 timers.end_stage('backward_pass')
-
+                
                 timers.start_stage('optimizer_step')
                 if (batch_count + 1) % accumulation_steps == 0:
-                    t0 = time.time()
-                    optimizer.step()
+                    if not skip_accumulation_window:
+                        optimizer.step()
+                    skip_accumulation_window = False
                 timers.end_stage('optimizer_step')
+                # Step the scheduler after each optimizer step during training
                 if scheduler_warmup is not None:
                     scheduler_warmup.step()
+            
+            # check if any model parameters are nan or inf
 
             if check_nan(list(model.parameters())) is not None:
-                logger.info("Model parameters contain NaN or Inf values after backward pass.")
+                logger.info ("Model parameters contain NaN or Inf values after backward pass.")
+                # restart from previous checkpoint
                 model.load_state_dict(torch.load(f"{self.output_dir}/model.pth"))
+                if optimizer is not None:
+                    optimizer.state.clear()  # moments may also be NaN
+                # check if model parameters contain nan
                 if check_nan(list(model.parameters())) is not None:
                     raise ValueError("Model parameters contain NaN or Inf values even after loading checkpoint.")
 
+            
             timers.start_stage('cleanup')
             del tmp_loss
             torch.cuda.empty_cache()
             timers.end_stage('cleanup')
-
+            
+            
             if evaluate_baseline:
                 timers.start_stage('baseline_forward')
                 baseline_outputs = baseline_model(input_embs, mask)
                 timers.end_stage('baseline_forward')
-
+                
+                # Time: Baseline loss computation
                 timers.start_stage('baseline_loss_computation')
                 if isinstance(self.config.baseline_config, list) and isinstance(baseline_outputs, dict):
                     for mode, mode_outputs in baseline_outputs.items():
@@ -274,9 +298,10 @@ class BaseTrain:
             timers.start_stage('dataloader')
             if max_num_batches is not None and batch_count >= max_num_batches - 1:
                 break
-
+        
         timers.end_stage('dataloader')
-
+        
+        # Log time profiling results
         if self.config.log_time:
             logger.info(timers.log_summary())
         logger.info('Trained metrics:')
@@ -290,6 +315,7 @@ class BaseTrain:
             else:
                 logger.info(baseline_metrics.log_summary())
 
+         # Compute final metrics
         del input_embs, mask, mapped_labels, sample_embeddings
         torch.cuda.empty_cache()
         if evaluate_baseline:
